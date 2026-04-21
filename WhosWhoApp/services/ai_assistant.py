@@ -1,7 +1,7 @@
 import os
-import asyncio
 import concurrent.futures
 from huggingface_hub import InferenceClient
+import traceback
 
 from django.conf import settings
 from ..models import StaffProfile
@@ -12,33 +12,36 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 
 
-
-
-
 class AIAssistant:
-    # Status constants
+
     STATUS_AVAILABLE = 'available'
     STATUS_UNAVAILABLE = 'unavailable'
 
+    FALLBACK_MODELS = [
+        "deepseek-ai/DeepSeek-V3",
+        "mistralai/Mistral-7B-Instruct-v0.3",
+        "Qwen/Qwen2.5-7B-Instruct",
+    ]
+
     def __init__(self):
         self.api_token = settings.HUGGINGFACE_API_TOKEN
-        self.model_name = os.environ.get('HUGGINGFACE_MODEL_NAME', 'deepseek-ai/DeepSeek-R1-Distill-Qwen-32B')
+        self.model_name = getattr(settings, 'HUGGINGFACE_MODEL_NAME', self.FALLBACK_MODELS[0])
         self.conversation_history = []
         if self.api_token:
-            self.client = InferenceClient(api_key=self.api_token)
+            self.client = InferenceClient(
+                api_key=self.api_token,
+                provider="together"
+            )
         else:
             self.client = None
 
-
     def add_to_history(self, message, is_user=True):
-
         self.conversation_history.append({
             'role': 'user' if is_user else 'assistant',
             'content': message
         })
 
     def get_availability_status(self, staff):
-
         if staff.status == self.STATUS_AVAILABLE:
             return "Available"
         elif staff.custom_status:
@@ -47,86 +50,53 @@ class AIAssistant:
 
     @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=4, max=20))
     def _make_api_request(self, prompt):
+        messages = [{"role": "user", "content": prompt}]
 
-        base_params = {
-            "prompt": prompt,
-            "stream": False,
-            "do_sample": True,
-            "top_p": 0.9,
-        }
-        
-        # Model-specific configurations because theres diffrance in capability. DS is more powerful than Mistral
-        model_configs = {
-            "deepseek": {
-                "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
-                "temperature": 0.3,
-                "max_new_tokens": 150,
-                "repetition_penalty": 1.1,
-                "timeout": 20
-            },
-            "mistral": {
-                "model": "mistralai/Mistral-Nemo-Instruct-2407",
-                "temperature": 0.55,
-                "max_new_tokens": 200,
-                "repetition_penalty": 1.05,
-                "timeout": 10
-            }
-        }
-        
+        for model in self.FALLBACK_MODELS:
+            try:
+                logging.info(f"Trying model: {model}")
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        self.client.chat_completion,
+                        messages=messages,
+                        model=model,
+                        max_tokens=300,
+                        temperature=0.3,
+                    )
+                    result = future.result(timeout=30)
+                self.model_name = model
+                return result.choices[0].message.content
+            except Exception as e:
+                logging.error(f"Model {model} failed: {str(e)}")
+                continue
 
-        def try_model(model_type):
-            config = model_configs[model_type]
-            params = {**base_params, **config}
-            self.model_name = params["model"]
-            timeout = params.pop("timeout")
-            
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(self.client.text_generation, **params)
-                try:
-                    return future.result(timeout=timeout)
-                except Exception as e:
-                    logging.error(f"Error with {model_type} model: {str(e)}")
-                    raise e
-
-        try:
-            logging.info("Attempting DeepSeek model")
-            return try_model("deepseek")
-        except Exception:
-            logging.info("Switching to Mistral model")
-            return try_model("mistral")
-
-
-
+        raise Exception("All models failed. Please try again later.")
 
     def clean_response(self, text):
-        # Store staff links and verify names
-        staff_links = []
         staff_link_pattern = r'<a href="/staff/(\d+)" class="staff-link">([^<]+)</a>'
-        
+
         def get_correct_name(staff_id):
             try:
                 staff = StaffProfile.objects.get(id=staff_id)
                 return staff.name
             except StaffProfile.DoesNotExist:
                 return '[Unknown Staff]'
-        
-        # Replace any mismatched names in staff links
+
         def replace_with_correct_name(match):
             staff_id = match.group(1)
             correct_name = get_correct_name(staff_id)
             return f'<a href="/staff/{staff_id}" class="staff-link">{correct_name}</a>'
-        
+
         text = re.sub(staff_link_pattern, replace_with_correct_name, text)
-        
-        # Expanded list of patterns to remove explanations and thinking
+
         explanation_patterns = [
             r'Step-by-step explanation:.*?(?=The most qualified person|Sorry, from my observation|$)',
             r'Understanding the Query:.*?(?=The most qualified person|Sorry, from my observation|$)',
             r'Here\'s why:.*?(?=The most qualified person|Sorry, from my observation|$)',
             r'Analysis:.*?(?=The most qualified person|Sorry, from my observation|$)',
             r'Let me explain:.*?(?=The most qualified person|Sorry, from my observation|$)',
-            r'\d+\.\s+.*?(?=The most qualified person|Sorry, from my observation|$)',  # Numbered explanations
-            r'\*\*.*?\*\*',  # Remove markdown bold text often used in explanations
+            r'\d+\.\s+.*?(?=The most qualified person|Sorry, from my observation|$)',
+            r'\*\*.*?\*\*',
         ] + [
             f'{starter}.*?(?=The most qualified person|Sorry, from my observation|$)'
             for starter in [
@@ -137,29 +107,24 @@ class AIAssistant:
                 'I will find', 'To answer this', 'Let\'s look at', 'Let\'s see',
             ]
         ]
-        
-        # Apply all patterns
+
         for pattern in explanation_patterns:
             text = re.sub(pattern, '', text, flags=re.DOTALL | re.IGNORECASE)
-        
-        # Store staff links before cleaning
+
         staff_links = []
-        staff_link_pattern = r'a href="/staff/\d+" class="staff-link"[^/]+/a'
-        matches = re.finditer(staff_link_pattern, text)
+        placeholder_pattern = r'a href="/staff/\d+" class="staff-link"[^/]+/a'
+        matches = re.finditer(placeholder_pattern, text)
         for i, match in enumerate(matches):
             staff_links.append(match.group(0))
             text = text.replace(match.group(0), f'STAFFLINK_{i}_PLACEHOLDER')
-        
-        # Clean up formatting but preserve staff link placeholders
+
         text = re.sub(r'(Question:|Answer:|Human:|Assistant:|</think>|First,|Initially,|Finally,|In conclusion,|Therefore,|So,|As a result,)', '', text)
         text = re.sub(r'\n+', ' ', text)
         text = re.sub(r'\s+', ' ', text)
-        
-        # Restore staff links
+
         for i, link in enumerate(staff_links):
             text = text.replace(f'STAFFLINK_{i}_PLACEHOLDER', link)
-        
-        # Ensure response starts with expected patterns and remove duplicates
+
         if "The most qualified person" in text:
             parts = text.split("The most qualified person")
             if len(parts) > 2:
@@ -169,11 +134,10 @@ class AIAssistant:
         elif "Sorry, from my observation" in text:
             if not text.strip().startswith("Sorry, from my observation"):
                 text = "Sorry, from my observation" + text.split("Sorry, from my observation")[1]
-        
+
         return text.strip()
 
     def generate_prompt(self, user_query, staff_info, context_text=None, is_email_request=False):
-
         if is_email_request:
             return f"""<s>[INST] Recent conversation context:
 {context_text}
@@ -207,29 +171,28 @@ STRICT RESPONSE FORMAT REQUIREMENTS:
 - THE MENTION OF BEST MATCHED STAFF IS NOT DEPENDANT ON AVAILABILITY
 - USE THE EXACT HTML FORMAT PROVIDED BELOW FOR STAFF LINKS
 - IN YOUR RESPONSE DO NOT INCLUDE YOUR THOUGHT PROCESS
-- KEEP YOUR RESPONSE CONCISE 
+- KEEP YOUR RESPONSE CONCISE
 - USERS MAY MAKE TYPOS SO TRY TO NORMALISE THE TEXT OF THE USER QUERY AS MUCH AS POSSIBLE
 
-
 Important matching guidelines:
-- Use your knowledge to understand relationships between similar skills and terms (e.g., "domain x” relates to "domain x” which relates to “tool x” and staff x has this tool in his skillset therefore he is a match)
+- Use your knowledge to understand relationships between similar skills and terms
 - Look for both exact matches and semantically related skills in staff profiles
 - Consider the broader context of roles and how they relate to the requested expertise
-- ONLY mention an alternative if they are available and their skills or roles are related to the user query. when mentioning an alternative staff member, make sure to ONLY mention the skills of theirs that are MOST relevant to the user query. If their skills are not directly or strongly related to the user query, do not mention that staff member as an alternative at all.
-- The best match is the staff member whose skills and roles are most relevant to the user query. If its close, choose the staff member with the most skills related to the user query OR the staff member with the most relevant roles related to the user query. Put yourself in the users shoes and think about who would be the best person to help them. roles and skills both compliment each other so consider both when making a decision. best match usually has a good combination of relevant roles and skills.
-- If you mention skills as part of the reason for best match or alternative (if any), make sure to ONLY mention their skills that are MOST relevant to the user query.
-- Be consistant with your matching. Different phrasing of the same query should result in the same staff member being mentioned. 
+- ONLY mention an alternative if they are available and their skills or roles are related to the user query
+- The best match is the staff member whose skills and roles are most relevant to the user query
+- Be consistent with your matching. Different phrasing of the same query should result in the same staff member being mentioned.
+
 Format your concise responses using these exact patterns:
 
 1. For staff mentions, use: <a href="/staff/{{staff_id:NUMBER}}" class="staff-link">[Name]</a>
 
-2. If best match is unavaible mention them however also mention the alternative if there is one AND if they are available):
+2. If best match is unavailable (mention them, and also mention alternative if available):
 "The most qualified person for this request is <a href="/staff/{{staff_id:NUMBER}}" class="staff-link">[Name]</a> ([Role]) because [reason]. Their current status is: [Status]. However, since they are unavailable, <a href="/staff/{{staff_id:NUMBER}}" class="staff-link">[Name]</a> ([Role]) can help because [reason]. Their status is: [Status]."
 
-3. If best match is available AND if no alternatives OR if there are no alternatives that are available):
+3. If best match is available (and no available alternatives):
 "The most qualified person for this request is <a href="/staff/{{staff_id:NUMBER}}" class="staff-link">[Name]</a> ([Role]) because [reason]. Their current status is: [Status]."
 
-4. When no one has any skills or roles that match the user query in any way:
+4. When no one matches the query at all:
 "Sorry, from my observation, I do not see anyone in the database that can help you with your query, please look for external help."
 
 Question: {user_query} [/INST]"""
@@ -239,9 +202,8 @@ Question: {user_query} [/INST]"""
             return "AI assistant is currently unavailable. Please contact the administrator to set up the Hugging Face API token."
 
         try:
-            # Reset conversation history for each new query to prevent caching effects
             self.conversation_history = []
-            
+
             all_staff = StaffProfile.objects.all()
             staff_info = "\n".join([
                 f"Staff Member: {staff.name}"
@@ -264,31 +226,25 @@ Question: {user_query} [/INST]"""
 
             logging.debug(f"User Query: {user_query}, Detected Email Request: {is_email_request}")
 
-            recent_context = None  # Remove context for non-email requests
+            recent_context = None
             prompt = self.generate_prompt(user_query, staff_info, recent_context, is_email_request)
 
             try:
-                response = self._make_api_request(prompt)
-                generated_text = ""
-                for chunk in response:
-                    if isinstance(chunk, str):
-                        generated_text += chunk
-                    else:
-                        generated_text += chunk.get("generated_text", "")
-
+                generated_text = self._make_api_request(prompt)
                 cleaned_response = self.clean_response(generated_text)
-                
-                # Only store history for email requests
+
                 if is_email_request:
                     self.add_to_history(user_query, is_user=True)
                     self.add_to_history(cleaned_response, is_user=False)
-                
+
                 return cleaned_response
 
             except Exception as api_error:
+                traceback.print_exc()
                 logging.error(f"API Error: {str(api_error)}")
                 return "I'm having trouble with the AI service. Please try again in a few moments."
 
         except Exception as e:
+            traceback.print_exc()
             logging.error(f"Error in get_response: {str(e)}")
             return "I'm having trouble processing your request. Please try again."
